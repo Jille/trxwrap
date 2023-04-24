@@ -1,6 +1,6 @@
 module github.com/Jille/trxwrap
 
-go 1.20
+go 1.18
 
 require (
 	github.com/jackc/pgconn v1.14.0
