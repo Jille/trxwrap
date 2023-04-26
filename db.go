@@ -1,148 +1,135 @@
-package trxwrap
+package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
-	"io"
+	"math/rand"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/jmoiron/sqlx"
+
+	"src.hexon.nl/bummer/v4"
+	"src.hexon.nl/jlr-orderevents/database/gendb"
 )
 
-type PgxHandle interface {
-	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-}
+const (
+	MAXRETRIES  = 3
+	RETRYWAIT   = 50 * time.Millisecond
+	RETRYJITTER = 5 * time.Millisecond
+)
 
-type PGDBTX interface {
-	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
-	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
-	QueryRow(context.Context, string, ...interface{}) pgx.Row
-}
+var (
+	db              *sqlx.DB
+	Transactionless *gendb.Queries
+)
 
-type TransactionRunner[Q any] func(*Q) error
+type TransactionRunner func(*gendb.Queries) error
 
-type TrxWrap[Q any] struct {
-	db    PgxHandle
-	gendb func(PGDBTX) *Q
-}
-
-func New[Q any](db PgxHandle, gendb func(PGDBTX) *Q) TrxWrap[Q] {
-	return TrxWrap[Q]{
-		db:    db,
-		gendb: gendb,
+func InitDatabase(driver, dsn string, maxConnections int) error {
+	var err error
+	db, err = sqlx.Connect(driver, dsn)
+	if err != nil {
+		return err
 	}
+
+	// Settings recommended by github.com/go-sql-driver/mysql to configure explicitly
+	db.SetConnMaxLifetime(90 * time.Second) // Default timeout on MariaDB servers is 2 minutes
+	db.SetMaxOpenConns(maxConnections)
+	db.SetMaxIdleConns(maxConnections)
+
+	Transactionless = gendb.New(wrappedPool{db})
+
+	return nil
 }
 
-func (w TrxWrap[Q]) RunRWTransaction(ctx context.Context, isolationLevel pgx.TxIsoLevel, runner TransactionRunner[Q]) error {
-	txo := pgx.TxOptions{
-		IsoLevel:   isolationLevel,
-		AccessMode: pgx.ReadWrite,
+func RunTransactionless(runner TransactionRunner) error {
+	return runner(Transactionless)
+}
+
+func RunRWTransaction(ctx context.Context, isolationLevel sql.IsolationLevel, runner TransactionRunner) error {
+	txo := sql.TxOptions{
+		Isolation: isolationLevel,
+		ReadOnly:  false,
 	}
-	return w.RunTransaction(ctx, txo, false, runner)
+	return RunTransaction(ctx, txo, runner)
 }
 
-func (w TrxWrap[Q]) RunROTransaction(ctx context.Context, isolationLevel pgx.TxIsoLevel, runner TransactionRunner[Q]) error {
-	txo := pgx.TxOptions{
-		IsoLevel:   isolationLevel,
-		AccessMode: pgx.ReadOnly,
+func RunROTransaction(ctx context.Context, isolationLevel sql.IsolationLevel, runner TransactionRunner) error {
+	txo := sql.TxOptions{
+		Isolation: isolationLevel,
+		ReadOnly:  true,
 	}
-	return w.RunTransaction(ctx, txo, true, runner)
+	return RunTransaction(ctx, txo, runner)
 }
 
-func (t TrxWrap[Q]) RunTransaction(ctx context.Context, txo pgx.TxOptions, idempotent bool, runner TransactionRunner[Q]) error {
-	return retry(ctx, func() (bool, error) {
-		return t.runTransactionOnce(ctx, txo, runner)
-	}, idempotent || txo.AccessMode == pgx.ReadOnly)
+func RunTransaction(ctx context.Context, txo sql.TxOptions, runner TransactionRunner) error {
+	var r retrier
+	return r.retry(ctx, func() (bool, error) {
+		return runTransactionOnce(ctx, txo, runner, &r)
+	}, txo.ReadOnly)
 }
 
-func retry(ctx context.Context, f func() (bool, error), idempotent bool) error {
+type retrier struct {
+	error bummer.PendingMessage
+}
+
+func (r *retrier) retry(ctx context.Context, f func() (bool, error), idempotent bool) error {
 	for attempt := 0; ; attempt++ {
 		commitAttempted, err := f()
-		if attempt >= 3 {
+		if attempt >= MAXRETRIES {
+			r.error.Send()
+			r.error = bummer.PendingMessage{}
 			return err
 		}
-		retry := pgconn.SafeToRetry(err)
-		switch ToSQLState(err) {
-		case "40001", "40P01":
+
+		retry := false
+		switch ToMySQLError(err) {
+		case 1205, // Lock wait timeout exceeded; try restarting transaction
+			1213, // Deadlock found when trying to get lock; try restarting transaction
+			1412, // Table definition has changed, please retry transaction
+			1587, // Too many files opened, please execute the command again
+			1613, // XA_RBTIMEOUT: Transaction branch was rolled back: took too long
+			1614, // XA_RBDEADLOCK: Transaction branch was rolled back: deadlock was detected
+			1637, // Too many active concurrent transactions
+			1689, // Wait on a lock was aborted due to a pending exclusive lock
+			3058: // Deadlock found when trying to get user-level lock; try rolling back transaction/releasing locks and restarting lock acquisition.
 			retry = true
-		case "08Q99", // io.EOF or io.UnexpectedEOF
-			"57P01", // admin_shutdown
-			"57P02", // crash_shutdown
-			"57P03", // cannot_connect_now
-			"08000", // connection_exception
-			"08003", // connection_does_not_exist
-			"08006", // connection_failure
-			"08001", // sqlclient_unable_to_establish_sqlconnection
-			"08004": // sqlserver_rejected_establishment_of_sqlconnection
+		case 1053, // Server shutdown in progress
+			1077, // Normal shutdown
+			1078, // Got signal %d. Aborting!
+			1079: // Shutdown complete
 			retry = !commitAttempted || idempotent
 		}
 		if retry {
-			// TODO: Exponential backoff?
-			time.Sleep(500 * time.Millisecond)
+			// Exponential backoff
+			wait := RETRYWAIT * time.Duration(attempt+1)
+			jitter := time.Duration(rand.Int63n(int64(RETRYJITTER)))
+			totalWait := wait + jitter
+
+			r.error.DropLevel(bummer.Warning).Send()
+			r.error = bummer.PendingMessage{}
+
+			time.Sleep(totalWait)
 			continue
 		}
+
+		r.error.Send()
+		r.error = bummer.PendingMessage{}
+
 		return err
 	}
 }
 
-func (t TrxWrap[Q]) runTransactionOnce(ctx context.Context, txo pgx.TxOptions, runner TransactionRunner[Q]) (commitAttempted bool, _ error) {
-	tx, err := t.db.BeginTx(ctx, txo)
-	if err != nil {
-		return false, wrapError(err)
+func ToMySQLError(err error) uint16 {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		return me.Number
 	}
-	q := t.gendb(wrappedTransaction{tx})
-	if err := runner(q); err != nil {
-		// TODO: Use multi-error to combine a possible error from rollback with err.
-		tx.Rollback(ctx)
-		return false, err
-	}
-	return true, wrapError(tx.Commit(ctx))
-}
-
-func ToSQLState(err error) string {
-	if e, ok := err.(Error); ok {
-		if e.parent == io.EOF || e.parent == io.ErrUnexpectedEOF {
-			return "08Q99"
-		}
-	}
-	var pge *pgconn.PgError
-	if errors.As(err, &pge) {
-		return pge.SQLState()
-	}
-	return ""
-}
-
-// wrapError wraps an error that comes from the database.
-// If the given error is nil, nil wil be returned.
-// The returned error will hide the actual error when returned through gRPC.
-func wrapError(err error) error {
-	if err == nil {
-		return nil
-	}
-	if err == pgx.ErrNoRows || err == pgx.ErrTxClosed || err == pgx.ErrTxCommitRollback {
-		return err
-	}
-	return Error{err}
-}
-
-type Error struct {
-	parent error
-}
-
-func (e Error) Error() string {
-	return e.parent.Error()
-}
-
-func (e Error) GRPCStatus() *status.Status {
-	return status.New(codes.Internal, "database error")
-}
-
-func (e Error) Unwrap() error {
-	return e.parent
+	return 0
 }
 
 func isReadOnlyQuery(sql string) bool {
@@ -150,4 +137,32 @@ func isReadOnlyQuery(sql string) bool {
 		sql = sql[strings.Index(sql, "\n")+1:]
 	}
 	return strings.HasPrefix(sql, "SELECT")
+}
+
+func runTransactionOnce(ctx context.Context, txo sql.TxOptions, runner TransactionRunner, r *retrier) (commitAttempted bool, _ error) {
+	tx, err := db.BeginTxx(ctx, &txo)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	q := gendb.New(&wrappedTransaction{
+		tx: tx,
+		r:  r,
+	})
+	if err := runner(q); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (r *retrier) maybeReportQueryError(err error, query string, args []interface{}) {
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+
+	// Send any previous error. In case a query in a transaction kept going instead of bailing out.
+	r.error.Send()
+
+	r.error = bummer.Global.NewError().Callsite(true).Backtrace(true).Freezef("Query (%s) (args: %v) failed: %v", query, args, err)
 }

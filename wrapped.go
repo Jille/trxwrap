@@ -1,64 +1,90 @@
-package trxwrap
+package database
 
 import (
 	"context"
+	"database/sql"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jmoiron/sqlx"
 )
 
-type wrappedRow struct {
-	rows pgx.Rows
+// wrappedPool automatically retries queries if applicable.
+type wrappedPool struct {
+	pool *sqlx.DB
 }
 
-func (r wrappedRow) Scan(dest ...interface{}) error {
-	if r.rows.Err() != nil {
-		return r.rows.Err()
-	}
-
-	if !r.rows.Next() {
-		if r.rows.Err() == nil {
-			return pgx.ErrNoRows
-		}
-		return r.rows.Err()
-	}
-
-	r.rows.Scan(dest...)
-	r.rows.Close()
-	return r.rows.Err()
+func (p wrappedPool) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	var ret sql.Result
+	var r retrier
+	err := r.retry(ctx, func() (bool, error) {
+		var err error
+		ret, err = p.pool.ExecContext(ctx, query, args...)
+		r.maybeReportQueryError(err, query, args)
+		return true, err
+	}, false)
+	return ret, err
 }
 
-type wrappedRowError struct {
-	err error
+func (p wrappedPool) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	var rows *sql.Rows
+	var r retrier
+	err := r.retry(ctx, func() (bool, error) {
+		var err error
+		rows, err = p.pool.QueryContext(ctx, query, args...)
+		r.maybeReportQueryError(err, query, args)
+		return true, err
+	}, isReadOnlyQuery(query))
+	return rows, err
 }
 
-func (r wrappedRowError) Scan(dest ...interface{}) error {
-	return r.err
+func (p wrappedPool) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	var row *sql.Row
+	var r retrier
+	_ = r.retry(ctx, func() (bool, error) {
+		row = p.pool.QueryRowContext(ctx, query, args...)
+		r.maybeReportQueryError(row.Err(), query, args)
+		return true, row.Err()
+	}, isReadOnlyQuery(query))
+	return row
 }
 
+func (p wrappedPool) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+	var stmt *sql.Stmt
+	var r retrier
+	err := r.retry(ctx, func() (bool, error) {
+		var err error
+		stmt, err = p.pool.PrepareContext(ctx, query)
+		r.maybeReportQueryError(err, query, nil)
+		return true, err
+	}, true)
+	return stmt, err
+}
+
+// wrappedTransaction executes queries inside a transaction. The entire transaction is automatically retried (see retry() in db.go).
 type wrappedTransaction struct {
-	tx pgx.Tx
+	tx *sqlx.Tx
+	r  *retrier
 }
 
-func (t wrappedTransaction) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
-	ct, err := t.tx.Exec(ctx, query, args...)
-	return ct, wrapError(err)
+func (t *wrappedTransaction) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	ct, err := t.tx.ExecContext(ctx, query, args...)
+	t.r.maybeReportQueryError(err, query, args)
+	return ct, err
 }
 
-func (t wrappedTransaction) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
-	rows, err := t.tx.Query(ctx, query, args...)
-	return rows, wrapError(err)
+func (t *wrappedTransaction) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	rows, err := t.tx.QueryContext(ctx, query, args...)
+	t.r.maybeReportQueryError(err, query, args)
+	return rows, err
 }
 
-func (t wrappedTransaction) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {
-	n, err := t.tx.CopyFrom(ctx, tableName, columnNames, rowSrc)
-	return n, wrapError(err)
+func (t *wrappedTransaction) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	row := t.tx.QueryRowContext(ctx, query, args...)
+	t.r.maybeReportQueryError(row.Err(), query, args)
+	return row
 }
 
-func (t wrappedTransaction) QueryRow(ctx context.Context, query string, args ...interface{}) pgx.Row {
-	rows, err := t.Query(ctx, query, args...)
-	if err != nil {
-		return wrappedRowError{err}
-	}
-	return wrappedRow{rows}
+func (t *wrappedTransaction) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+	stmt, err := t.tx.PrepareContext(ctx, query)
+	t.r.maybeReportQueryError(err, query, nil)
+	return stmt, err
 }
